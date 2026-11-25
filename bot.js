@@ -14,7 +14,7 @@ let rawPhone = (process.env.PHONE || "8801984698728").replace(/[^0-9]/g, '');
 if (rawPhone.startsWith('01') && rawPhone.length === 11) rawPhone = '88' + rawPhone;
 const PHONE         = rawPhone;
 
-const IDLE_MINUTES  = 10;   // এত মিনিট তুমি কিছু না লিখলে বট নিজে নিজে চালু হবে
+const IDLE_MINUTES  = 5;   // এত মিনিট তুমি কিছু না লিখলে বট নিজে নিজে চালু হবে
 const RESET_MINUTES = 30;   // ৩০ মিনিট পরে একই ব্যক্তির count reset
 const MAX_REPLY     = 2;    // ৩০ মিনিটে একজনকে সর্বোচ্চ ২ বার greeting
 const DELETE_AFTER  = 5;    // ৫ মিনিট পরে মেসেজ delete
@@ -101,6 +101,7 @@ function getButtonAction(msg, text) {
 async function sendReplyWithButtons(s, jid, name, number) {
     const numberLine = number ? `🌐 Number : +${number}\n\n` : '';
     const text = `Hey ${name} 🌸
+    
 ${numberLine}Welcome to RA J Personal Assistant With Ghost Hunter 🤖
 
 📩 Your message has been received successfully.
@@ -113,7 +114,6 @@ But don't worry — your message has been forwarded successfully ✅
 ⏳ Please wait patiently...
 
 😎 My Boss : RA J 🤘
-👑 Owner : @raj150k
 ⚡ Assistant : Ghost Hunter
 📞 Emergency Contact : 01984698728
 
