@@ -14,7 +14,7 @@ let rawPhone = (process.env.PHONE || "8801984698728").replace(/[^0-9]/g, '');
 if (rawPhone.startsWith('01') && rawPhone.length === 11) rawPhone = '88' + rawPhone;
 const PHONE         = rawPhone;
 
-const IDLE_MINUTES  = 5;   // এত মিনিট তুমি কিছু না লিখলে বট নিজে নিজে চালু হবে
+const IDLE_MINUTES  = 5;    // এত মিনিট তুমি কিছু না লিখলে বট নিজে নিজে চালু হবে
 const RESET_MINUTES = 30;   // ৩০ মিনিট পরে একই ব্যক্তির count reset
 const MAX_REPLY     = 2;    // ৩০ মিনিটে একজনকে সর্বোচ্চ ২ বার greeting
 const DELETE_AFTER  = 5;    // ৫ মিনিট পরে মেসেজ delete
@@ -38,7 +38,7 @@ app.listen(process.env.PORT || 3000, () => console.log('Server started on port '
 function trackBotMsg(id) {
     if (!id) return;
     botSentIds.add(id);
-    setTimeout(() => botSentIds.delete(id), 120000);
+    setTimeout(() => botSentIds.delete(id), (DELETE_AFTER + 2) * 60000);
 }
 
 async function goInvisible(s) {
@@ -52,12 +52,34 @@ async function sendSilent(s, jid, content, opts = {}) {
     return sent;
 }
 
+// ভেতরে ঢুকে থাকা মেসেজ unwrap করা (ephemeral/viewOnce wrapper)
+function unwrapMessage(m) {
+    if (!m) return m;
+    if (m.ephemeralMessage && m.ephemeralMessage.message) return unwrapMessage(m.ephemeralMessage.message);
+    if (m.viewOnceMessage && m.viewOnceMessage.message) return unwrapMessage(m.viewOnceMessage.message);
+    if (m.documentWithCaptionMessage && m.documentWithCaptionMessage.message) return unwrapMessage(m.documentWithCaptionMessage.message);
+    return m;
+}
+
+// মেসেজের আসল সময় (পুরনো sync মেসেজ যেন online ধরা না হয়)
+function msgTime(msg) {
+    const mt = msg.messageTimestamp;
+    let t = 0;
+    if (mt) {
+        if (typeof mt === 'number') t = mt;
+        else if (typeof mt.toNumber === 'function') t = mt.toNumber();
+        else t = Number(mt) || 0;
+    }
+    if (t > 1000000000000) return t;
+    if (t > 1000000000) return t * 1000;
+    return Date.now();
+}
+
 // ⭐ আসল নাম্বার বের করার চেষ্টা (LID হলে খালি থাকবে)
-function extractNumber(msg, jid) {
+function extractNumber(m, msg, jid) {
     const jidUser = jid.split('@')[0];
     const isLid = jid.endsWith('@lid');
-    const ctx = msg.message && msg.message.extendedTextMessage
-        ? msg.message.extendedTextMessage.contextInfo : null;
+    const ctx = m.extendedTextMessage ? m.extendedTextMessage.contextInfo : null;
     const candidates = [
         msg.key.participantAlt,
         msg.key.participantPn,
@@ -74,34 +96,11 @@ function extractNumber(msg, jid) {
     return '';
 }
 
-// ⭐ বাটনে চাপ পড়েছে কি না ধরা
-function getButtonAction(msg, text) {
-    const m = msg.message;
-    const btn = m.buttonsResponseMessage;
-    if (btn) {
-        const id = btn.selectedButtonId || '';
-        if (id === 'fb_link' || (btn.selectedDisplayText || '').includes('Facebook')) return 'fb';
-        if (id === 'tg_link' || (btn.selectedDisplayText || '').includes('Telegram')) return 'tg';
-    }
-    const inter = m.interactiveResponseMessage;
-    if (inter && inter.nativeFlowResponseMessage && inter.nativeFlowResponseMessage.paramsJson) {
-        try {
-            const p = JSON.parse(inter.nativeFlowResponseMessage.paramsJson);
-            if (p.id === 'fb_link') return 'fb';
-            if (p.id === 'tg_link') return 'tg';
-        } catch {}
-    }
-    const t = (text || '').trim();
-    if (t === '📘 Facebook') return 'fb';
-    if (t === '✈️ Telegram') return 'tg';
-    return null;
-}
-
 // বাটন সহ greeting — মেসেজ হুবহু তোমার দেওয়াটাই
 async function sendReplyWithButtons(s, jid, name, number) {
     const numberLine = number ? `🌐 Number : +${number}\n\n` : '';
     const text = `Hey ${name} 🌸
-    
+
 ${numberLine}Welcome to RA J Personal Assistant With Ghost Hunter 🤖
 
 📩 Your message has been received successfully.
@@ -137,17 +136,19 @@ But don't worry — your message has been forwarded successfully ✅
                         nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
                             buttons: [
                                 {
-                                    name: "quick_reply",
+                                    name: "cta_url",
                                     buttonParamsJson: JSON.stringify({
                                         display_text: "📘 Facebook",
-                                        id: "fb_link"
+                                        url: "https://facebook.com/raj150k",
+                                        merchant_url: "https://facebook.com/raj150k"
                                     })
                                 },
                                 {
-                                    name: "quick_reply",
+                                    name: "cta_url",
                                     buttonParamsJson: JSON.stringify({
                                         display_text: "✈️ Telegram",
-                                        id: "tg_link"
+                                        url: "https://t.me/raj150k",
+                                        merchant_url: "https://t.me/raj150k"
                                     })
                                 }
                             ]
@@ -252,49 +253,62 @@ async function start() {
         if (type !== 'notify') return;
         for (const msg of messages) {
             if (!msg.message) continue;
-            const jid  = msg.key.remoteJid;
-            const text = msg.message.conversation
-                      || (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text)
-                      || (msg.message.imageMessage && msg.message.imageMessage.caption)
-                      || (msg.message.videoMessage && msg.message.videoMessage.caption)
-                      || (msg.message.documentMessage && msg.message.documentMessage.caption)
+            const jid = msg.key.remoteJid;
+            if (!jid) continue;
+
+            // ভেতরের আসল মেসেজ বের করা
+            const m = unwrapMessage(msg.message);
+
+            const text = m.conversation
+                      || (m.extendedTextMessage && m.extendedTextMessage.text)
+                      || (m.imageMessage && m.imageMessage.caption)
+                      || (m.videoMessage && m.videoMessage.caption)
+                      || (m.documentMessage && m.documentMessage.caption)
                       || '';
 
-            // ---------- তোমার নিজের মেসেজ: শুধু "online" হিসেবে গণ্য, কোনো command নেই ----------
+            // ---------- তোমার নিজের মেসেজ ----------
             if (msg.key.fromMe) {
+
+                // ⭐ delete/revoke/reaction — সবসময় ignore, কখনো online ধরা হবে না
+                if (m.protocolMessage || m.reactionMessage) {
+                    console.log("🗑 মেসেজ delete/reaction → Boss online ধরা হয়নি");
+                    continue;
+                }
+
+                // বটের নিজের পাঠানো মেসেজ echo — ignore
                 if (botSentIds.has(msg.key.id)) { botSentIds.delete(msg.key.id); continue; }
-                lastActive = Date.now();   // তুমি মেসেজ দিলেই বট থেমে যাবে
+
+                // status/story বাদ
+                if (jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) continue;
+
+                // খালি/টেকনিক্যাল মেসেজ — ignore
+                const hasContent = !!(m.conversation || m.extendedTextMessage ||
+                    m.imageMessage || m.videoMessage ||
+                    m.documentMessage || m.audioMessage ||
+                    m.stickerMessage || m.contactMessage ||
+                    m.locationMessage);
+                if (!hasContent) continue;
+
+                // শুধু সত্যিকারের এখনকার মেসেজ হলে বট থামবে
+                const age = Date.now() - msgTime(msg);
+                if (age < 3 * 60000) {
+                    lastActive = Date.now();
+                    console.log("⏸ Boss নিজে মেসেজ দিয়েছে → বট " + IDLE_MINUTES + " মিনিটের জন্য বন্ধ");
+                }
                 continue;
             }
 
             // ---------- Incoming ----------
-            if (!jid) continue;
             if (jid.endsWith('@g.us') || jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) continue;
 
-            // ⭐ বাটনে চাপ দিলে — boss online থাকুক বা offline, লিংক পাঠাবেই
-            const action = getButtonAction(msg, text);
-            if (action) {
-                const linkText = action === 'fb'
-                    ? "📘 Facebook : https://facebook.com/raj150k"
-                    : "✈️ Telegram : https://t.me/raj150k";
-                try {
-                    const sent = await sendSilent(sock, jid, { text: linkText }, { quoted: msg });
-                    setTimeout(async () => {
-                        try {
-                            const del = await sock.sendMessage(jid, { delete: sent.key });
-                            if (del && del.key && del.key.id) trackBotMsg(del.key.id);
-                            await goInvisible(sock);
-                        } catch {}
-                    }, DELETE_AFTER * 60000);
-                } catch (e) { console.log("Link send failed:", e.message); }
-                continue;
-            }
+            // অন্যের delete/reaction এও greeting যাবে না
+            if (m.protocolMessage || m.reactionMessage) continue;
 
-            // ⭐ বাকি সব: boss offline থাকলে greeting যাবে (সব অটোমেটিক, command লাগে না)
+            // boss offline থাকলে greeting যাবে (সব অটোমেটিক)
             if (!isOffline()) continue;
 
             const name   = msg.pushName || "Friend";
-            const number = extractNumber(msg, jid);
+            const number = extractNumber(m, msg, jid);
             const now    = Date.now();
 
             if (!users[jid]) users[jid] = { count: 0, time: now };
