@@ -1,0 +1,12 @@
+{
+  "name": "ghost-wa",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "scripts": { "start": "node bot.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "pino": "^9.0.0",
+    "express": "^4.19.0"
+  }
+}
