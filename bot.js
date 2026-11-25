@@ -10,28 +10,24 @@ const pino = require('pino');
 const express = require('express');
 
 // ================= Settings =================
-// তোমার নাম্বার 01984698728 কান্ট্রি কোড (88) সহ বসানো হয়েছে
 let rawPhone = (process.env.PHONE || "8801984698728").replace(/[^0-9]/g, '');
 if (rawPhone.startsWith('01') && rawPhone.length === 11) rawPhone = '88' + rawPhone;
 const PHONE         = rawPhone;
 
-const IDLE_MINUTES  = 10;   // ১০ মিনিট তুমি কিছু না লিখলে = Offline
-const RESET_MINUTES = 30;   // ৩০ মিনিট পরে count reset
-const MAX_REPLY     = 2;    // ৩০ মিনিটে সর্বোচ্চ ২ বার reply
-const DELETE_AFTER  = 5;    // ৫ মিনিট পরে reply delete
+const IDLE_MINUTES  = 10;   // এত মিনিট তুমি কিছু না লিখলে বট নিজে নিজে চালু হবে
+const RESET_MINUTES = 30;   // ৩০ মিনিট পরে একই ব্যক্তির count reset
+const MAX_REPLY     = 2;    // ৩০ মিনিটে একজনকে সর্বোচ্চ ২ বার greeting
+const DELETE_AFTER  = 5;    // ৫ মিনিট পরে মেসেজ delete
 
 // ================= State =================
-let manualOffline = null;
-let lastActive    = 0;      // শুরু থেকেই Offline মোডে থাকবে
+let lastActive    = 0;      // শুরুতেই offline ধরা থাকবে → বট সাথে সাথে কাজ করা শুরু
 let wasOffline    = true;
 const users       = {};
 const botSentIds  = new Set();
 let sock = null;
 let intervalStarted = false;
 
-const isOffline = () => manualOffline !== null
-    ? manualOffline
-    : (Date.now() - lastActive) > IDLE_MINUTES * 60000;
+const isOffline = () => (Date.now() - lastActive) > IDLE_MINUTES * 60000;
 
 // ================= Keep-alive (Render) =================
 const app = express();
@@ -42,7 +38,7 @@ app.listen(process.env.PORT || 3000, () => console.log('Server started on port '
 function trackBotMsg(id) {
     if (!id) return;
     botSentIds.add(id);
-    setTimeout(() => botSentIds.delete(id), 60000);
+    setTimeout(() => botSentIds.delete(id), 120000);
 }
 
 async function goInvisible(s) {
@@ -56,12 +52,56 @@ async function sendSilent(s, jid, content, opts = {}) {
     return sent;
 }
 
-// বাটন সহ reply — তোমার আসল মেসেজ একদম আগের মতোই রাখা হয়েছে
-async function sendReplyWithButtons(s, jid, name, number) {
-    const text = `Hey ${name} 🌸
-📱 Number : +${number}
+// ⭐ আসল নাম্বার বের করার চেষ্টা (LID হলে খালি থাকবে)
+function extractNumber(msg, jid) {
+    const jidUser = jid.split('@')[0];
+    const isLid = jid.endsWith('@lid');
+    const ctx = msg.message && msg.message.extendedTextMessage
+        ? msg.message.extendedTextMessage.contextInfo : null;
+    const candidates = [
+        msg.key.participantAlt,
+        msg.key.participantPn,
+        msg.key.remoteJidAlt,
+        ctx ? ctx.participant : null
+    ].filter(c => typeof c === 'string' && c.length > 0);
 
-Welcome to RA J Personal Assistant With Ghost Hunter 🤖
+    for (const c of candidates) {
+        if (c.endsWith('@lid')) continue;
+        const n = c.split('@')[0].split(':')[0];
+        if (/^\d{8,15}$/.test(n)) return n;
+    }
+    if (!isLid && /^\d{8,15}$/.test(jidUser)) return jidUser;
+    return '';
+}
+
+// ⭐ বাটনে চাপ পড়েছে কি না ধরা
+function getButtonAction(msg, text) {
+    const m = msg.message;
+    const btn = m.buttonsResponseMessage;
+    if (btn) {
+        const id = btn.selectedButtonId || '';
+        if (id === 'fb_link' || (btn.selectedDisplayText || '').includes('Facebook')) return 'fb';
+        if (id === 'tg_link' || (btn.selectedDisplayText || '').includes('Telegram')) return 'tg';
+    }
+    const inter = m.interactiveResponseMessage;
+    if (inter && inter.nativeFlowResponseMessage && inter.nativeFlowResponseMessage.paramsJson) {
+        try {
+            const p = JSON.parse(inter.nativeFlowResponseMessage.paramsJson);
+            if (p.id === 'fb_link') return 'fb';
+            if (p.id === 'tg_link') return 'tg';
+        } catch {}
+    }
+    const t = (text || '').trim();
+    if (t === '📘 Facebook') return 'fb';
+    if (t === '✈️ Telegram') return 'tg';
+    return null;
+}
+
+// বাটন সহ greeting — মেসেজ হুবহু তোমার দেওয়াটাই
+async function sendReplyWithButtons(s, jid, name, number) {
+    const numberLine = number ? `🌐 Number : +${number}\n\n` : '';
+    const text = `Hey ${name} 🌸
+${numberLine}Welcome to RA J Personal Assistant With Ghost Hunter 🤖
 
 📩 Your message has been received successfully.
 
@@ -97,27 +137,17 @@ But don't worry — your message has been forwarded successfully ✅
                         nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
                             buttons: [
                                 {
-                                    name: "cta_copy",
-                                    buttonParamsJson: JSON.stringify({
-                                        display_text: "📞 Copy Number",
-                                        id: "copy_number",
-                                        copy_code: "01984698728"
-                                    })
-                                },
-                                {
-                                    name: "cta_url",
+                                    name: "quick_reply",
                                     buttonParamsJson: JSON.stringify({
                                         display_text: "📘 Facebook",
-                                        url: "https://facebook.com/raj150k",
-                                        merchant_url: "https://facebook.com/raj150k"
+                                        id: "fb_link"
                                     })
                                 },
                                 {
-                                    name: "cta_url",
+                                    name: "quick_reply",
                                     buttonParamsJson: JSON.stringify({
                                         display_text: "✈️ Telegram",
-                                        url: "https://t.me/raj150k",
-                                        merchant_url: "https://t.me/raj150k"
+                                        id: "tg_link"
                                     })
                                 }
                             ]
@@ -171,7 +201,7 @@ async function start() {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         markOnlineOnConnect: false,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'] // Pairing code ১০০% কাজ করার জন্য দরকারি
+        browser: ['Ubuntu', 'Chrome', '20.0.04']
     });
 
     if (!sock.authState.creds.registered) {
@@ -230,33 +260,41 @@ async function start() {
                       || (msg.message.documentMessage && msg.message.documentMessage.caption)
                       || '';
 
-            // ---------- তোমার নিজের মেসেজ / Commands ----------
+            // ---------- তোমার নিজের মেসেজ: শুধু "online" হিসেবে গণ্য, কোনো command নেই ----------
             if (msg.key.fromMe) {
                 if (botSentIds.has(msg.key.id)) { botSentIds.delete(msg.key.id); continue; }
-                lastActive = Date.now();
-                const t = text.trim().toLowerCase();
-
-                if (t === '!offline') { manualOffline = true;  await sendSilent(sock, jid, { text: "🔴 Offline mode ON" }); }
-                else if (t === '!online') { manualOffline = false; await sendSilent(sock, jid, { text: "🟢 Online mode ON" }); }
-                else if (t === '!auto') { manualOffline = null; await sendSilent(sock, jid, { text: "⚙️ Auto mode ON" }); }
-                else if (t === '!status') {
-                    const mode = manualOffline === null ? 'AUTO' : manualOffline ? 'MANUAL OFFLINE' : 'MANUAL ONLINE';
-                    const idle = lastActive === 0 ? IDLE_MINUTES : Math.floor((Date.now() - lastActive) / 60000);
-                    await sendSilent(sock, jid, { text: `📊 Mode: ${mode}\n⏱ Idle: ${idle} min\n🤖 Auto-reply: ${isOffline() ? 'ON' : 'OFF'}` });
-                }
-                else if (t === '!help') {
-                    await sendSilent(sock, jid, { text: "🤖 Ghost Hunter Commands\n\n!offline - জোর করে Offline\n!online - জোর করে Online\n!auto - Auto Mode (10 min চুপ = Offline)\n!status - এখন কোন Mode এ আছে\n!help - এই লিস্ট" });
-                }
+                lastActive = Date.now();   // তুমি মেসেজ দিলেই বট থেমে যাবে
                 continue;
             }
 
             // ---------- Incoming ----------
             if (!jid) continue;
             if (jid.endsWith('@g.us') || jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) continue;
+
+            // ⭐ বাটনে চাপ দিলে — boss online থাকুক বা offline, লিংক পাঠাবেই
+            const action = getButtonAction(msg, text);
+            if (action) {
+                const linkText = action === 'fb'
+                    ? "📘 Facebook : https://facebook.com/raj150k"
+                    : "✈️ Telegram : https://t.me/raj150k";
+                try {
+                    const sent = await sendSilent(sock, jid, { text: linkText }, { quoted: msg });
+                    setTimeout(async () => {
+                        try {
+                            const del = await sock.sendMessage(jid, { delete: sent.key });
+                            if (del && del.key && del.key.id) trackBotMsg(del.key.id);
+                            await goInvisible(sock);
+                        } catch {}
+                    }, DELETE_AFTER * 60000);
+                } catch (e) { console.log("Link send failed:", e.message); }
+                continue;
+            }
+
+            // ⭐ বাকি সব: boss offline থাকলে greeting যাবে (সব অটোমেটিক, command লাগে না)
             if (!isOffline()) continue;
 
             const name   = msg.pushName || "Friend";
-            const number = jid.split('@')[0];
+            const number = extractNumber(msg, jid);
             const now    = Date.now();
 
             if (!users[jid]) users[jid] = { count: 0, time: now };
@@ -267,7 +305,7 @@ async function start() {
             try {
                 const sent = await sendReplyWithButtons(sock, jid, name, number);
                 data.count++;
-                console.log(`Replied to ${name} (+${number}) [${data.count}/${MAX_REPLY}]`);
+                console.log(`Replied to ${name}${number ? ` (+${number})` : ''} [${data.count}/${MAX_REPLY}]`);
                 setTimeout(async () => {
                     try {
                         const del = await sock.sendMessage(jid, { delete: sent.key });
