@@ -1,17 +1,28 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    generateWAMessageFromContent,
+    proto
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const express = require('express');
 
 // ================= Settings =================
-const PHONE         = process.env.PHONE || "8801XXXXXXXXX"; // তোমার নাম্বার, + ছাড়া
-const IDLE_MINUTES  = 10;
-const RESET_MINUTES = 30;
-const MAX_REPLY     = 2;
-const DELETE_AFTER  = 5;
+// তোমার নাম্বার 01984698728 কান্ট্রি কোড (88) সহ বসানো হয়েছে
+let rawPhone = (process.env.PHONE || "8801984698728").replace(/[^0-9]/g, '');
+if (rawPhone.startsWith('01') && rawPhone.length === 11) rawPhone = '88' + rawPhone;
+const PHONE         = rawPhone;
+
+const IDLE_MINUTES  = 10;   // ১০ মিনিট তুমি কিছু না লিখলে = Offline
+const RESET_MINUTES = 30;   // ৩০ মিনিট পরে count reset
+const MAX_REPLY     = 2;    // ৩০ মিনিটে সর্বোচ্চ ২ বার reply
+const DELETE_AFTER  = 5;    // ৫ মিনিট পরে reply delete
 
 // ================= State =================
 let manualOffline = null;
-let lastActive    = Date.now();
+let lastActive    = 0;      // শুরু থেকেই Offline মোডে থাকবে
 let wasOffline    = true;
 const users       = {};
 const botSentIds  = new Set();
@@ -28,17 +39,24 @@ app.get('/', (_, res) => res.send(`Ghost Hunter alive ✅ | mode: ${isOffline() 
 app.listen(process.env.PORT || 3000, () => console.log('Server started on port ' + (process.env.PORT || 3000)));
 
 // ================= Helpers =================
+function trackBotMsg(id) {
+    if (!id) return;
+    botSentIds.add(id);
+    setTimeout(() => botSentIds.delete(id), 60000);
+}
+
 async function goInvisible(s) {
     try { if (s) await s.sendPresenceUpdate('unavailable'); } catch {}
 }
+
 async function sendSilent(s, jid, content, opts = {}) {
     const sent = await s.sendMessage(jid, content, opts);
-    if (sent && sent.key && sent.key.id) botSentIds.add(sent.key.id);
+    if (sent && sent.key && sent.key.id) trackBotMsg(sent.key.id);
     await goInvisible(s);
     return sent;
 }
 
-// বাটন সহ reply - তোমার আসল মেসেজ একদম আগের মতোই
+// বাটন সহ reply — তোমার আসল মেসেজ একদম আগের মতোই রাখা হয়েছে
 async function sendReplyWithButtons(s, jid, name, number) {
     const text = `Hey ${name} 🌸
 📱 Number : +${number}
@@ -62,43 +80,79 @@ But don't worry — your message has been forwarded successfully ✅
 ✨ Thank you for messaging ✨`;
 
     try {
-        const sent = await s.sendMessage(jid, {
-            interactiveMessage: {
-                header: { hasMediaAttachment: false },
-                body: { text: text },
-                footer: { text: "👇 Tap a button below 👇" },
-                nativeFlowMessage: {
-                    buttons: [
+        const msgContent = generateWAMessageFromContent(jid, {
+            viewOnceMessage: {
+                message: {
+                    messageContextInfo: {
+                        deviceListMetadata: {},
+                        deviceListMetadataVersion: 2
+                    },
+                    interactiveMessage: proto.Message.InteractiveMessage.fromObject({
+                        body: proto.Message.InteractiveMessage.Body.fromObject({ text: text }),
+                        footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: "👇 Tap a button below 👇" }),
+                        header: proto.Message.InteractiveMessage.Header.fromObject({
+                            title: "",
+                            hasMediaAttachment: false
+                        }),
+                        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
+                            buttons: [
+                                {
+                                    name: "cta_copy",
+                                    buttonParamsJson: JSON.stringify({
+                                        display_text: "📞 Copy Number",
+                                        id: "copy_number",
+                                        copy_code: "01984698728"
+                                    })
+                                },
+                                {
+                                    name: "cta_url",
+                                    buttonParamsJson: JSON.stringify({
+                                        display_text: "📘 Facebook",
+                                        url: "https://facebook.com/raj150k",
+                                        merchant_url: "https://facebook.com/raj150k"
+                                    })
+                                },
+                                {
+                                    name: "cta_url",
+                                    buttonParamsJson: JSON.stringify({
+                                        display_text: "✈️ Telegram",
+                                        url: "https://t.me/raj150k",
+                                        merchant_url: "https://t.me/raj150k"
+                                    })
+                                }
+                            ]
+                        })
+                    })
+                }
+            }
+        }, { userJid: s.user.id });
+
+        trackBotMsg(msgContent.key.id);
+
+        await s.relayMessage(jid, msgContent.message, {
+            messageId: msgContent.key.id,
+            additionalNodes: [
+                {
+                    tag: 'biz',
+                    attrs: {},
+                    content: [
                         {
-                            name: "cta_copy_code",
-                            buttonParamsJson: JSON.stringify({
-                                display_text: "📞 Copy Number",
-                                copy_code: "01984698728"
-                            })
-                        },
-                        {
-                            name: "cta_url",
-                            buttonParamsJson: JSON.stringify({
-                                display_text: "📘 Facebook",
-                                url: "https://facebook.com/raj150k",
-                                enc: []
-                            })
-                        },
-                        {
-                            name: "cta_url",
-                            buttonParamsJson: JSON.stringify({
-                                display_text: "✈️ Telegram",
-                                url: "https://t.me/raj150k",
-                                enc: []
-                            })
+                            tag: 'interactive',
+                            attrs: { type: 'native_flow', v: '1' },
+                            content: [
+                                {
+                                    tag: 'native_flow',
+                                    attrs: { v: '9', name: 'mixed' }
+                                }
+                            ]
                         }
                     ]
                 }
-            }
+            ]
         });
-        if (sent && sent.key && sent.key.id) botSentIds.add(sent.key.id);
+
         await goInvisible(s);
-        return sent;
+        return msgContent;
     } catch (e) {
         console.log("Button failed, normal text pathacche:", e.message);
         const fallback = text + "\n\n━━━━━━━━━━━━━━\n📘 Facebook : https://facebook.com/raj150k\n✈️ Telegram : https://t.me/raj150k\n📞 Emergency : 01984698728";
@@ -117,7 +171,7 @@ async function start() {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         markOnlineOnConnect: false,
-        browser: ['Ghost Hunter', 'Chrome', '1.0']
+        browser: ['Ubuntu', 'Chrome', '20.0.04'] // Pairing code ১০০% কাজ করার জন্য দরকারি
     });
 
     if (!sock.authState.creds.registered) {
@@ -125,10 +179,11 @@ async function start() {
             try {
                 const code = await sock.requestPairingCode(PHONE);
                 console.log("\n==============================");
+                console.log("NUMBER:", PHONE);
                 console.log("PAIRING CODE:", code);
                 console.log("==============================\n");
             } catch (e) { console.log("Pairing error:", e.message); }
-        }, 3000);
+        }, 5000);
     }
 
     sock.ev.on('creds.update', saveCreds);
@@ -139,7 +194,9 @@ async function start() {
             await goInvisible(sock);
         }
         if (connection === 'close') {
-            const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output ? lastDisconnect.error.output.statusCode : null;
+            const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
+                ? lastDisconnect.error.output.statusCode
+                : null;
             if (code === DisconnectReason.loggedOut) {
                 console.log("Logged out ❌ — session মুছে আবার pair করো।");
             } else {
@@ -184,7 +241,7 @@ async function start() {
                 else if (t === '!auto') { manualOffline = null; await sendSilent(sock, jid, { text: "⚙️ Auto mode ON" }); }
                 else if (t === '!status') {
                     const mode = manualOffline === null ? 'AUTO' : manualOffline ? 'MANUAL OFFLINE' : 'MANUAL ONLINE';
-                    const idle = Math.floor((Date.now() - lastActive) / 60000);
+                    const idle = lastActive === 0 ? IDLE_MINUTES : Math.floor((Date.now() - lastActive) / 60000);
                     await sendSilent(sock, jid, { text: `📊 Mode: ${mode}\n⏱ Idle: ${idle} min\n🤖 Auto-reply: ${isOffline() ? 'ON' : 'OFF'}` });
                 }
                 else if (t === '!help') {
@@ -212,7 +269,11 @@ async function start() {
                 data.count++;
                 console.log(`Replied to ${name} (+${number}) [${data.count}/${MAX_REPLY}]`);
                 setTimeout(async () => {
-                    try { await sock.sendMessage(jid, { delete: sent.key }); await goInvisible(sock); } catch {}
+                    try {
+                        const del = await sock.sendMessage(jid, { delete: sent.key });
+                        if (del && del.key && del.key.id) trackBotMsg(del.key.id);
+                        await goInvisible(sock);
+                    } catch {}
                 }, DELETE_AFTER * 60000);
             } catch (e) { console.log("Reply failed:", e.message); }
         }
