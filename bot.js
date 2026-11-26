@@ -1,185 +1,232 @@
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
     generateWAMessageFromContent,
-    proto,
+    normalizeMessageContent,
+    makeCacheableSignalKeyStore,
     initAuthCreds,
     BufferJSON,
-    makeCacheableSignalKeyStore
+    proto
 } = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const express = require('express');
-const fs = require('fs');
+
 const { MongoClient } = require('mongodb');
+const { randomBytes } = require('node:crypto');
+const express = require('express');
+const logger = require('pino')({ level: 'silent' });
 
 // ================= Settings =================
-let rawPhone = (process.env.PHONE || "8801984698728").replace(/[^0-9]/g, '');
-if (rawPhone.startsWith('01') && rawPhone.length === 11) rawPhone = '88' + rawPhone;
-const PHONE         = rawPhone;
-const MONGODB_URI   = process.env.MONGODB_URI || "";
+const MONGODB_URI = (process.env.MONGODB_URI || '').trim();
+const EMERGENCY_CONTACT = '01984698728';
+const FACEBOOK_URL = 'https://facebook.com/raj150k';
+const TELEGRAM_URL = 'https://t.me/raj150k';
 
-const FACEBOOK_URL  = "https://facebook.com/raj150k";
-const TELEGRAM_URL  = "https://t.me/raj150k";
+let PHONE = (process.env.PHONE || EMERGENCY_CONTACT).replace(/\D/g, '');
+if (/^01\d{9}$/.test(PHONE)) PHONE = '88' + PHONE;
 
-const IDLE_MINUTES  = 5;    // এত মিনিট তুমি কিছু না করলে বট নিজে চালু হবে
-const RESET_MINUTES = 30;   // ৩০ মিনিট পরে একই ব্যক্তির count reset
-const MAX_REPLY     = 2;    // ৩০ মিনিটে একজনকে সর্বোচ্চ ২ বার greeting
-const DELETE_AFTER  = 5;    // ৫ মিনিট পরে মেসেজ delete
+const IDLE_MS = 5 * 60_000;
+const REPLY_WINDOW_MS = 30 * 60_000;
+const MAX_REPLIES = 2;
+const DELETE_AFTER_MS = 5 * 60_000;
 
 // ================= State =================
-let lastActive    = 0;
-let wasOffline    = true;
-let botBusyUntil  = 0;
-let isConnected   = false;
-let pairingCode   = null;
-const users       = {};
-const botSentIds  = new Set();
 let sock = null;
-let intervalStarted = false;
-let mongoClient = null;
+let connected = false;
+let lastActive = 0;
 let authCollection = null;
+let retryTimer = null;
 
-const isOffline = () => (Date.now() - lastActive) > IDLE_MINUTES * 60000;
+const replyLimits = new Map();
+const botMessageIds = new Set();
+const isOffline = () => Date.now() - lastActive >= IDLE_MS;
 
-// ডিলিট/ব্যাকগ্রাউন্ড মেসেজ — তোমার আসল মেসেজ না
-const IGNORE_KEYS = ['protocolMessage', 'senderKeyDistributionMessage', 'messageContextInfo'];
-function isRealUserMessage(message) {
-    if (!message) return false;
-    return Object.keys(message).some(k => !IGNORE_KEYS.includes(k));
+function errorText(error) {
+    return String(error?.message || error || 'Unknown error')
+        .replace(/mongodb(?:\+srv)?:\/\/[^\r\n]*/gi, '[MongoDB URI hidden]');
 }
 
-// ================= Website (Status + Pairing Code) =================
+// ================= Render status page =================
 const app = express();
+
 app.get('/', (_, res) => {
-    res.send(`<meta name="viewport" content="width=device-width,initial-scale=1">
-        <div style="font-family:sans-serif;text-align:center;padding:20px">
-        <h2>Ghost Hunter alive ✅</h2>
-        <p>WhatsApp: ${isConnected ? 'Connected ✅' : 'Not connected ❌'}</p>
-        ${(!isConnected && pairingCode) ? `<h1 style="letter-spacing:4px">${pairingCode}</h1><p>WhatsApp > Linked Devices > Link with phone number</p>` : ''}
-        <p>Mode: ${isOffline() ? 'OFFLINE 💤 (auto-reply ON)' : 'ONLINE 🟢 (auto-reply OFF)'}</p>
-        </div>`);
-});
-app.listen(process.env.PORT || 3000, () => console.log('Server started on port ' + (process.env.PORT || 3000)));
+    const connection = connected ? 'Connected ✅' : 'Not connected ❌';
+    const mode = !connected
+        ? 'Waiting for WhatsApp'
+        : isOffline()
+            ? 'OFFLINE 💤 (auto-reply ON)'
+            : 'ONLINE 🟢 (auto-reply OFF)';
 
-// ================= MongoDB Session (রিস্টার্টেও লগইন থাকবে) =================
-async function useMongoAuthState(collection) {
-    const writeData = (data, id) => collection.replaceOne(
-        { _id: id },
-        { _id: id, value: JSON.stringify(data, BufferJSON.replacer) },
-        { upsert: true }
+    res.set('Cache-Control', 'no-store').type('text/plain').send(
+        `Ghost Hunter alive ✅\nWhatsApp: ${connection}\nMode: ${mode}\n`
     );
-    const readData = async (id) => {
-        const doc = await collection.findOne({ _id: id });
-        return doc ? JSON.parse(doc.value, BufferJSON.reviver) : null;
-    };
-    const removeData = (id) => collection.deleteOne({ _id: id });
+});
 
-    const creds = (await readData('creds')) || initAuthCreds();
+const port = Number(process.env.PORT) || 3000;
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server started on port ${port}`);
+});
+
+// ================= MongoDB session =================
+async function useMongoAuthState(collection) {
+    const encode = value => JSON.stringify(value, BufferJSON.replacer);
+    const decode = value => JSON.parse(value, BufferJSON.reviver);
+
+    const saved = await collection.findOne({ _id: 'creds' });
+    const creds = saved ? decode(saved.value) : initAuthCreds();
+
+    // একই সেশনের লেখাগুলো ক্রমানুসারে হবে।
+    let pending = Promise.resolve();
+
+    function queue(work) {
+        const job = pending.then(work);
+        pending = job.catch(() => {});
+        return job;
+    }
 
     return {
         state: {
             creds,
             keys: {
-                get: async (type, ids) => {
-                    const data = {};
-                    await Promise.all(ids.map(async (id) => {
-                        let value = await readData(`${type}-${id}`);
+                async get(type, ids) {
+                    if (!ids.length) return {};
+                    await pending;
+
+                    const docs = await collection.find({
+                        _id: { $in: ids.map(id => `${type}-${id}`) }
+                    }).toArray();
+
+                    const values = new Map(docs.map(doc => [doc._id, doc.value]));
+
+                    return Object.fromEntries(ids.map(id => {
+                        const stored = values.get(`${type}-${id}`);
+                        let value = stored == null ? null : decode(stored);
+
                         if (type === 'app-state-sync-key' && value) {
                             value = proto.Message.AppStateSyncKeyData.fromObject(value);
                         }
-                        data[id] = value;
+
+                        return [id, value];
                     }));
-                    return data;
                 },
-                set: async (data) => {
-                    const tasks = [];
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const key = `${category}-${id}`;
-                            tasks.push(value ? writeData(value, key) : removeData(key));
+
+                set(updates) {
+                    return queue(async () => {
+                        const operations = [];
+
+                        for (const [type, entries] of Object.entries(updates)) {
+                            for (const [id, value] of Object.entries(entries)) {
+                                const _id = `${type}-${id}`;
+
+                                if (value == null) {
+                                    operations.push({ deleteOne: { filter: { _id } } });
+                                } else {
+                                    operations.push({
+                                        replaceOne: {
+                                            filter: { _id },
+                                            replacement: { _id, value: encode(value) },
+                                            upsert: true
+                                        }
+                                    });
+                                }
+                            }
                         }
-                    }
-                    await Promise.all(tasks);
+
+                        if (operations.length) {
+                            await collection.bulkWrite(operations);
+                        }
+                    });
                 }
             }
         },
-        saveCreds: () => writeData(creds, 'creds'),
-        clear: () => collection.deleteMany({})
+
+        saveCreds: () => queue(() => collection.replaceOne(
+            { _id: 'creds' },
+            { _id: 'creds', value: encode(creds) },
+            { upsert: true }
+        )),
+
+        flush: () => pending,
+
+        // এই collection শুধু এই বটের WhatsApp সেশনের জন্য।
+        clear: () => queue(() => collection.deleteMany({}))
     };
 }
 
 async function getAuth() {
-    if (MONGODB_URI) {
-        if (!mongoClient) {
-            mongoClient = new MongoClient(MONGODB_URI);
-            await mongoClient.connect();
-            authCollection = mongoClient.db('ghostbot').collection('session');
-            console.log("MongoDB connected ✅ (session safe)");
-        }
-        return useMongoAuthState(authCollection);
+    if (authCollection) return useMongoAuthState(authCollection);
+
+    const client = new MongoClient(MONGODB_URI, {
+        serverSelectionTimeoutMS: 15_000
+    });
+
+    try {
+        await client.connect();
+        const collection = client.db('ghostbot').collection('session');
+        const auth = await useMongoAuthState(collection);
+
+        // ডাটাবেসে পড়া সফল হওয়ার পরই collection মনে রাখবে।
+        authCollection = collection;
+        console.log('MongoDB connected ✅');
+        return auth;
+    } catch (error) {
+        await client.close().catch(() => {});
+        throw error;
     }
-    console.log("⚠️ MONGODB_URI নেই — Render restart হলে আবার pair করতে হবে");
-    const s = await useMultiFileAuthState('session');
-    return { ...s, clear: async () => fs.rmSync('session', { recursive: true, force: true }) };
 }
 
-// ================= Helpers =================
-function trackBotMsg(id) {
-    if (!id) return;
-    botSentIds.add(id);
-    setTimeout(() => botSentIds.delete(id), 120000);
+// ================= Message helpers =================
+function rememberBotMessage(id) {
+    if (!id || botMessageIds.has(id)) return;
+    botMessageIds.add(id);
+    setTimeout(() => botMessageIds.delete(id), IDLE_MS + 60_000).unref();
 }
 
-async function goInvisible(s) {
-    try { if (s) await s.sendPresenceUpdate('unavailable'); } catch {}
-}
+async function sendBotMessage(s, jid, content) {
+    // পাঠানোর আগেই ID মনে রাখে, যাতে নিজের মেসেজকে activity না ধরে।
+    const messageId = '3EB0' + randomBytes(9).toString('hex').toUpperCase();
+    rememberBotMessage(messageId);
 
-async function sendSilent(s, jid, content, opts = {}) {
-    botBusyUntil = Date.now() + 10000;
-    const sent = await s.sendMessage(jid, content, opts);
-    if (sent && sent.key && sent.key.id) trackBotMsg(sent.key.id);
-    await goInvisible(s);
+    const sent = await s.sendMessage(jid, content, { messageId });
+    rememberBotMessage(sent?.key?.id);
     return sent;
 }
 
-async function deleteBotMsg(s, jid, key) {
+async function setUnavailable(s) {
+    if (sock !== s || !connected || !isOffline()) return;
     try {
-        botBusyUntil = Date.now() + 10000;
-        const del = await s.sendMessage(jid, { delete: key });
-        if (del && del.key && del.key.id) trackBotMsg(del.key.id);
-        await goInvisible(s);
+        await s.sendPresenceUpdate('unavailable');
     } catch {}
 }
 
-function extractNumber(msg, jid) {
-    const jidUser = jid.split('@')[0];
-    const isLid = jid.endsWith('@lid');
-    const ctx = msg.message && msg.message.extendedTextMessage
-        ? msg.message.extendedTextMessage.contextInfo : null;
-    const candidates = [
-        msg.key.participantAlt,
-        msg.key.participantPn,
-        msg.key.remoteJidAlt,
-        ctx ? ctx.participant : null
-    ].filter(c => typeof c === 'string' && c.length > 0);
+function isUserMessage(message) {
+    const content = normalizeMessageContent(message);
 
-    for (const c of candidates) {
-        if (c.endsWith('@lid')) continue;
-        const n = c.split('@')[0].split(':')[0];
-        if (/^\d{8,15}$/.test(n)) return n;
+    if (!content || content.protocolMessage || content.reactionMessage) {
+        return false;
     }
-    if (!isLid && /^\d{8,15}$/.test(jidUser)) return jidUser;
+
+    return [
+        'conversation', 'extendedTextMessage', 'imageMessage',
+        'videoMessage', 'audioMessage', 'documentMessage',
+        'stickerMessage', 'contactMessage', 'contactsArrayMessage',
+        'locationMessage', 'liveLocationMessage',
+        'pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3'
+    ].some(type => Boolean(content[type]));
+}
+
+function extractNumber(key) {
+    for (const candidate of [key.remoteJid, key.remoteJidAlt, key.senderPn, key.participantPn]) {
+        if (typeof candidate !== 'string') continue;
+        const match = candidate.match(/^([1-9]\d{7,14})(?::\d+)?@s\.whatsapp\.net$/);
+        if (match) return match[1];
+    }
     return '';
 }
 
-// বাটন সহ greeting — মেসেজ হুবহু তোমার দেওয়াটাই
 async function sendReplyWithButtons(s, jid, name, number) {
     const numberLine = number ? `🌐 Number : +${number}\n\n` : '';
     const text = `Hey ${name} 🌸
-    
+
 ${numberLine}Welcome to RA J Personal Assistant With Ghost Hunter 🤖
 
 📩 Your message has been received successfully.
@@ -193,12 +240,26 @@ But don't worry — your message has been forwarded successfully ✅
 
 😎 My Boss : RA J 
 ⚡ Assistant : Ghost Hunter
-📞 Emergency Contact : 01984698728
+📞 Emergency Contact : ${EMERGENCY_CONTACT}
 
 ✨ Thank you for messaging ✨`;
 
+    let sent;
+
     try {
-        const msgContent = generateWAMessageFromContent(jid, {
+        const buttons = [
+            ['📘 Facebook', FACEBOOK_URL],
+            ['✈️ Telegram', TELEGRAM_URL]
+        ].map(([label, url]) => ({
+            name: 'cta_url',
+            buttonParamsJson: JSON.stringify({
+                display_text: label,
+                url,
+                merchant_url: url
+            })
+        }));
+
+        sent = generateWAMessageFromContent(jid, {
             viewOnceMessage: {
                 message: {
                     messageContextInfo: {
@@ -206,179 +267,230 @@ But don't worry — your message has been forwarded successfully ✅
                         deviceListMetadataVersion: 2
                     },
                     interactiveMessage: proto.Message.InteractiveMessage.fromObject({
-                        body: proto.Message.InteractiveMessage.Body.fromObject({ text: text }),
-                        footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: "👇 Tap a button below 👇" }),
-                        header: proto.Message.InteractiveMessage.Header.fromObject({
-                            title: "",
-                            hasMediaAttachment: false
-                        }),
-                        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
-                            buttons: [
-                                {
-                                    name: "cta_url",
-                                    buttonParamsJson: JSON.stringify({
-                                        display_text: "📘 Facebook",
-                                        url: FACEBOOK_URL,
-                                        merchant_url: FACEBOOK_URL
-                                    })
-                                },
-                                {
-                                    name: "cta_url",
-                                    buttonParamsJson: JSON.stringify({
-                                        display_text: "✈️ Telegram",
-                                        url: TELEGRAM_URL,
-                                        merchant_url: TELEGRAM_URL
-                                    })
-                                }
-                            ]
-                        })
+                        header: { title: '', hasMediaAttachment: false },
+                        body: { text },
+                        footer: { text: '👇 Tap a button below 👇' },
+                        nativeFlowMessage: { buttons }
                     })
                 }
             }
         }, { userJid: s.user.id });
 
-        trackBotMsg(msgContent.key.id);
-        botBusyUntil = Date.now() + 10000;
+        rememberBotMessage(sent.key.id);
 
-        await s.relayMessage(jid, msgContent.message, {
-            messageId: msgContent.key.id,
-            additionalNodes: [
-                {
-                    tag: 'biz',
-                    attrs: {},
-                    content: [
-                        {
-                            tag: 'interactive',
-                            attrs: { type: 'native_flow', v: '1' },
-                            content: [{ tag: 'native_flow', attrs: { v: '9', name: 'mixed' } }]
-                        }
-                    ]
-                }
-            ]
+        await s.relayMessage(jid, sent.message, {
+            messageId: sent.key.id,
+            additionalNodes: [{
+                tag: 'biz',
+                attrs: {},
+                content: [{
+                    tag: 'interactive',
+                    attrs: { type: 'native_flow', v: '1' },
+                    content: [{
+                        tag: 'native_flow',
+                        attrs: { v: '9', name: 'mixed' }
+                    }]
+                }]
+            }]
         });
+    } catch (error) {
+        console.warn('Button send failed:', errorText(error));
+        sent = await sendBotMessage(s, jid, {
+            text: text + `\n\n━━━━━━━━━━━━━━\n📘 Facebook : ${FACEBOOK_URL}\n✈️ Telegram : ${TELEGRAM_URL}\n📞 Emergency : ${EMERGENCY_CONTACT}`
+        });
+    }
 
-        await goInvisible(s);
-        return msgContent;
-    } catch (e) {
-        console.log("Button failed, normal text pathacche:", e.message);
-        const fallback = text + `\n\n━━━━━━━━━━━━━━\n📘 Facebook : ${FACEBOOK_URL}\n✈️ Telegram : ${TELEGRAM_URL}\n📞 Emergency : 01984698728`;
-        return await sendSilent(s, jid, { text: fallback });
+    await setUnavailable(s);
+    return sent;
+}
+
+async function deleteBotReply(jid, key) {
+    const s = sock;
+    if (!s || !connected || !key?.id) return;
+
+    try {
+        await sendBotMessage(s, jid, { delete: key });
+        await setUnavailable(s);
+    } catch (error) {
+        console.warn('Delete failed:', errorText(error));
     }
 }
 
-// ================= Main =================
+// ================= Incoming messages =================
+async function handleMessages(s, { messages = [], type }) {
+    for (const msg of messages) {
+        if (sock !== s || !connected) return;
+        if (!msg.key || !isUserMessage(msg.message)) continue;
+
+        const key = msg.key;
+
+        if (key.fromMe) {
+            if (botMessageIds.has(key.id)) continue;
+
+            // শুধু সাম্প্রতিক আসল মেসেজ activity হিসেবে গুনবে।
+            const now = Date.now();
+            const sentAt = Number(msg.messageTimestamp?.toString() || 0) * 1000;
+
+            if (sentAt >= now - IDLE_MS && sentAt <= now + 10_000) {
+                lastActive = Math.max(lastActive, Math.min(sentAt, now));
+            }
+            continue;
+        }
+
+        const jid = key.remoteJid;
+        if (type !== 'notify' || typeof jid !== 'string') continue;
+        if (!/@(?:s\.whatsapp\.net|lid)$/.test(jid) || !isOffline()) continue;
+
+        const now = Date.now();
+        let limit = replyLimits.get(jid);
+
+        if (!limit || now - limit.since >= REPLY_WINDOW_MS) {
+            limit = { since: now, count: 0 };
+            replyLimits.set(jid, limit);
+        }
+
+        if (limit.count >= MAX_REPLIES) continue;
+
+        // পাঠানোর আগেই স্লট রাখে, একসাথে মেসেজ এলেও সীমা ছাড়াবে না।
+        limit.count++;
+
+        try {
+            const sent = await sendReplyWithButtons(
+                s, jid, msg.pushName || 'Friend', extractNumber(key)
+            );
+
+            console.log(`Replied to private chat [${limit.count}/${MAX_REPLIES}]`);
+
+            if (sent?.key?.id) {
+                setTimeout(
+                    () => void deleteBotReply(jid, sent.key),
+                    DELETE_AFTER_MS
+                ).unref();
+            }
+        } catch (error) {
+            limit.count--;
+            console.error('Reply failed:', errorText(error));
+        }
+    }
+}
+
+// ================= WhatsApp connection =================
+function retryIn(ms) {
+    if (retryTimer) return;
+
+    retryTimer = setTimeout(() => {
+        retryTimer = null;
+        void start();
+    }, ms);
+}
+
 async function start() {
     try {
-        const { state, saveCreds, clear } = await getAuth();
+        const auth = await getAuth();
         const { version } = await fetchLatestBaileysVersion();
-        const logger = pino({ level: 'silent' });
 
-        sock = makeWASocket({
+        const s = makeWASocket({
             version,
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, logger)
-            },
             logger,
+            auth: {
+                creds: auth.state.creds,
+                keys: makeCacheableSignalKeyStore(auth.state.keys, logger)
+            },
             printQRInTerminal: false,
+            emitOwnEvents: false,
             markOnlineOnConnect: false,
             browser: ['Ubuntu', 'Chrome', '20.0.04']
         });
 
-        if (!sock.authState.creds.registered) {
-            const thisSock = sock;
-            setTimeout(async () => {
-                try {
-                    if (thisSock !== sock) return;
-                    const code = await thisSock.requestPairingCode(PHONE);
-                    pairingCode = (code.match(/.{1,4}/g) || [code]).join('-');
-                    console.log("\n==============================");
-                    console.log("NUMBER:", PHONE);
-                    console.log("PAIRING CODE:", pairingCode);
-                    console.log("Website-e dekhabe: https://ghost-wa.onrender.com");
-                    console.log("==============================\n");
-                } catch (e) { console.log("Pairing error:", e.message); }
-            }, 5000);
-        }
+        sock = s;
+        let pairingRequested = false;
 
-        sock.ev.on('creds.update', saveCreds);
+        s.ev.on('creds.update', update => {
+            if (sock !== s) return;
+            Object.assign(auth.state.creds, update);
 
-        sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
-            if (connection === 'open') {
-                isConnected = true;
-                pairingCode = null;
-                console.log("Ghost Hunter Running... ✅");
-                await goInvisible(sock);
-            }
+            void auth.saveCreds().catch(error => {
+                console.error('Session save error:', errorText(error));
+            });
+        });
+
+        s.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+            if (sock !== s) return;
+
             if (connection === 'close') {
-                isConnected = false;
-                const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
-                    ? lastDisconnect.error.output.statusCode
-                    : null;
-                if (code === DisconnectReason.loggedOut) {
-                    console.log("Logged out ❌ — নতুন pairing code আনা হচ্ছে...");
-                    try { await clear(); } catch {}
-                    setTimeout(start, 5000);
-                } else {
-                    console.log("Reconnecting...");
-                    setTimeout(start, 3000);
+                connected = false;
+                sock = null;
+                await auth.flush();
+
+                const status = lastDisconnect?.error?.output?.statusCode;
+
+                if (status === DisconnectReason.connectionReplaced) {
+                    console.warn('Connection replaced — একই সেশন দিয়ে একটাই বট চালাও।');
+                    return;
                 }
+
+                if (status === DisconnectReason.loggedOut) {
+                    console.warn('WhatsApp logged out — নতুন করে লিংক করতে হবে।');
+
+                    try {
+                        await auth.clear();
+                    } catch (error) {
+                        console.error('Session reset error:', errorText(error));
+                    }
+
+                    retryIn(15_000);
+                    return;
+                }
+
+                console.log(`Reconnecting... (${status ?? 'unknown'})`);
+                retryIn(status === DisconnectReason.restartRequired ? 1_000 : 10_000);
+                return;
             }
-        });
 
-        if (!intervalStarted) {
-            intervalStarted = true;
-            setInterval(async () => {
-                const off = isOffline();
-                if (off !== wasOffline) {
-                    console.log(off ? "💤 Boss offline → auto-reply ON" : "🟢 Boss online → auto-reply OFF");
-                    wasOffline = off;
-                }
-                if (off && sock && isConnected) await goInvisible(sock);
-            }, 60000);
-        }
+            if (connection === 'open') {
+                connected = true;
+                console.log('Ghost Hunter Running... ✅');
+                await setUnavailable(s);
+                return;
+            }
 
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-            for (const msg of messages) {
-                if (!msg.message) continue;
-                const jid = msg.key.remoteJid;
-
-                // তোমার নিজের আসল মেসেজ = online
-                if (msg.key.fromMe) {
-                    if (botSentIds.has(msg.key.id)) { botSentIds.delete(msg.key.id); continue; }
-                    if (Date.now() < botBusyUntil) continue;
-                    if (!isRealUserMessage(msg.message)) continue;
-                    lastActive = Date.now();
-                    continue;
-                }
-
-                // Incoming
-                if (!jid) continue;
-                if (jid.endsWith('@g.us') || jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) continue;
-                if (!isRealUserMessage(msg.message)) continue;
-                if (!isOffline()) continue;
-
-                const name   = msg.pushName || "Friend";
-                const number = extractNumber(msg, jid);
-                const now    = Date.now();
-
-                if (!users[jid]) users[jid] = { count: 0, time: now };
-                const data = users[jid];
-                if (now - data.time > RESET_MINUTES * 60000) { data.count = 0; data.time = now; }
-                if (data.count >= MAX_REPLY) continue;
+            // WhatsApp pairing-এর জন্য প্রস্তুত হলেই কোড চায়।
+            if (qr && !auth.state.creds.registered && !pairingRequested) {
+                pairingRequested = true;
 
                 try {
-                    const sent = await sendReplyWithButtons(sock, jid, name, number);
-                    data.count++;
-                    console.log(`Replied to ${name}${number ? ` (+${number})` : ''} [${data.count}/${MAX_REPLY}]`);
-                    setTimeout(() => deleteBotMsg(sock, jid, sent.key), DELETE_AFTER * 60000);
-                } catch (e) { console.log("Reply failed:", e.message); }
+                    const code = await s.requestPairingCode(PHONE);
+                    if (sock === s && !connected) console.log('PAIRING CODE:', code);
+                } catch (error) {
+                    pairingRequested = false;
+                    console.error('Pairing error:', errorText(error));
+                }
             }
         });
-    } catch (e) {
-        console.log("Start error:", e.message, "— 10 sec por abar try...");
-        setTimeout(start, 10000);
+
+        s.ev.on('messages.upsert', update => {
+            void handleMessages(s, update).catch(error => {
+                console.error('Message handler error:', errorText(error));
+            });
+        });
+    } catch (error) {
+        console.error('Start error:', errorText(error));
+        retryIn(15_000);
     }
 }
-start();
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [jid, limit] of replyLimits) {
+        if (now - limit.since >= REPLY_WINDOW_MS) replyLimits.delete(jid);
+    }
+}, 60_000).unref();
+
+if (!/^mongodb(?:\+srv)?:\/\//.test(MONGODB_URI) ||
+    /<db_password>|<password>|PASSWORD_HERE/i.test(MONGODB_URI)) {
+    console.error('Setup error: Render Environment-এ সঠিক MONGODB_URI বসাও।');
+} else if (!/^[1-9]\d{7,14}$/.test(PHONE)) {
+    console.error('Setup error: PHONE-এ কান্ট্রি কোডসহ WhatsApp নম্বর দাও, + ছাড়া।');
+} else {
+    void start();
+                     }
